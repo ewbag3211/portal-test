@@ -706,15 +706,6 @@ do
     local PICKUP_CLICKS = 2                 -- klik per item
     local PICKUP_DISTANCE = 4               -- jarak berdiri dari item saat mengambil (stud)
     local ORE_GONE_WAIT = 0   -- tunggu sekian detik setelah ore hilang (0 = langsung cek drop)
-    -- Cek mining benar-benar jalan setelah tekan F. Kalau tidak ada perubahan di ore
-    -- dalam MINING_CHECK_TIME detik -> pickaxe belum dipegang: tekan Q lalu F lagi.
-    -- (disimpan dalam satu tabel supaya tidak menambah jumlah variabel local)
-    local MINING_CHECK = {
-        enabled = true,
-        time = 2,        -- detik menunggu tanda mining setelah tekan F
-        retry = 2,       -- berapa kali coba Q > F sebelum menyerah
-        equipWait = 0.6, -- jeda setelah tekan Q (animasi ambil pickaxe)
-    }
     local DROP_CLEAR_WAIT = 2 -- drop harus kosong selama sekian detik berturut-turut sebelum lanjut
     local DROP_GRACE = 1                    -- setelah ore hilang, tunggu sebentar kalau-kalau drop baru muncul (dtk)
 
@@ -727,41 +718,51 @@ do
     local PRIORITY_DROP_PARTS = { "GoldVeinedQuartz" }
     local PRIORITY_WAIT_MAX = 30 -- batas tunggu di satu drop prioritas (detik), supaya tidak macet
 
-    -- Timeout khusus per jenis ore (detik). Jenis yang tidak ada di sini memakai kolom "Timeout ore hilang".
-    -- Tekan satu tombol (tahan sebentar lalu lepas)
-    function MINING_CHECK.pressKey(keyCode)
-        VirtualInputManager:SendKeyEvent(true, keyCode, false, game)
+    -- ==========================================================
+    -- PASTIKAN PICKAXE DIPEGANG SEBELUM TEKAN F
+    -- Q itu toggle (pasang/lepas), jadi Q HANYA ditekan kalau di karakter
+    -- tidak ada Tool sama sekali. Kalau sudah pegang, Q tidak ditekan.
+    -- (disimpan dalam satu tabel supaya tidak menambah jumlah variabel local)
+    -- ==========================================================
+    local PICKAXE = {
+        enabled = true,
+        equipWait = 1,      -- tunggu setelah tekan Q (animasi ambil pickaxe)
+        supported = nil,    -- nil = belum tahu, false = pickaxe di game ini bukan Tool -> berhenti tekan Q
+    }
+
+    function PICKAXE.isHolding()
+        local character = player.Character
+        return character ~= nil and character:FindFirstChildOfClass("Tool") ~= nil
+    end
+
+    -- true = siap menambang
+    function PICKAXE.ensure(waitFn, statusFn)
+        if not PICKAXE.enabled or PICKAXE.supported == false then
+            return true
+        end
+        if PICKAXE.isHolding() then
+            PICKAXE.supported = true
+            return true
+        end
+        statusFn("Pickaxe belum dipegang, tekan Q")
+        VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.Q, false, game)
         task.wait(0.05)
-        VirtualInputManager:SendKeyEvent(false, keyCode, false, game)
+        VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Q, false, game)
+        if not waitFn(PICKAXE.equipWait) then
+            return false
+        end
+        if PICKAXE.isHolding() then
+            PICKAXE.supported = true
+        elseif PICKAXE.supported == nil then
+            -- Tekan Q tapi tetap tidak ada Tool: pickaxe di game ini bukan Tool.
+            -- Berhenti tekan Q supaya tidak bolak-balik pasang/lepas.
+            PICKAXE.supported = false
+            warn("[Miner] Pickaxe tidak terdeteksi sebagai Tool, cek pickaxe dimatikan")
+        end
+        return true
     end
 
-    -- "Sidik jari" kondisi ore: attribute, isi Value, ukuran/transparansi part, jumlah isi.
-    -- Kalau berubah setelah tekan F, berarti mining jalan (ore kena pukul).
-    function MINING_CHECK.snapshot(ore)
-        local model = ore and ore.Parent
-        if not model then
-            return "hilang"
-        end
-        local parts = {}
-        local function add(inst)
-            for name, value in pairs(inst:GetAttributes()) do
-                table.insert(parts, inst.Name .. "." .. name .. "=" .. tostring(value))
-            end
-            if inst:IsA("ValueBase") then
-                table.insert(parts, inst.Name .. "=" .. tostring(inst.Value))
-            elseif inst:IsA("BasePart") then
-                table.insert(parts, inst.Name .. ":" .. tostring(inst.Size) .. ":" .. inst.Transparency)
-            end
-        end
-        add(model)
-        local descendants = model:GetDescendants()
-        for i = 1, math.min(#descendants, 60) do
-            add(descendants[i])
-        end
-        table.insert(parts, "n=" .. #descendants)
-        return table.concat(parts, "|")
-    end
-
+    -- Timeout khusus per jenis ore (detik). Jenis yang tidak ada di sini memakai kolom "Timeout ore hilang".
     local TYPE_TIMEOUTS = {
         Aurorite = 25,
     }
@@ -1728,7 +1729,7 @@ do
         if not waitFor(0.3) then return end -- beri waktu karakter mendarat
 
         -- 3. Klik di X,Y sampai ore habis atau jumlah klik tercapai
-        local beforeSnap = MINING_CHECK.snapshot(target.ore) -- kondisi ore sebelum F, untuk cek mining jalan
+        if not PICKAXE.ensure(waitFor, setStatus) then return end
         for i = 1, settings.clicks do
             if not target.ore.Parent then
                 break -- ore sudah hilang, berarti tertambang
@@ -1739,32 +1740,6 @@ do
             task.wait(HOLD_TIME)
             VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.F, false, game)
             if not waitFor(CLICK_GAP) then return end
-        end
-
-        -- 3b. Pastikan mining benar-benar jalan.
-        --     Tanda mining = ada yang berubah di ore (attribute/HP/value/part) atau ore hilang.
-        --     Kalau tidak ada tanda -> pickaxe belum dipegang: tekan Q (pakai pickaxe) > F lagi.
-        --     Q itu toggle, jadi Q HANYA ditekan kalau mining terbukti tidak jalan.
-        if MINING_CHECK.enabled then
-            for attempt = 1, MINING_CHECK.retry do
-                if not target.ore.Parent then break end
-                local started = false
-                local deadline = os.clock() + MINING_CHECK.time
-                while os.clock() < deadline do
-                    if not target.ore.Parent or MINING_CHECK.snapshot(target.ore) ~= beforeSnap then
-                        started = true
-                        break
-                    end
-                    if not waitFor(0.1) then return end
-                end
-                if started then break end
-
-                setStatus(string.format("Mining tidak jalan, tekan Q > F (%d/%d)", attempt, MINING_CHECK.retry))
-                MINING_CHECK.pressKey(Enum.KeyCode.Q)
-                if not waitFor(MINING_CHECK.equipWait) then return end
-                beforeSnap = MINING_CHECK.snapshot(target.ore)
-                MINING_CHECK.pressKey(Enum.KeyCode.F)
-            end
         end
 
         -- 4. OFF: tunggu sampai ore hilang, tanpa batas waktu. Ore hilang = ON lagi.
